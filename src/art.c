@@ -21,6 +21,12 @@
 #define LEAF_RAW(x) ((art_leaf*)((void*)((uintptr_t)x & ~1)))
 
 /**
+ * Macros for computing the minimum of several numbers
+ */
+#define MIN3(a, b, c) ((a) < (b) ? ((a) < (c) ? (a) : (c)) : ((b) < (c) ? (b) : (c)))
+#define MIN2(a, b) ((a) < (b) ? (a) : (b))
+
+/**
  * Allocates a node of the given type,
  * initializes to zero and sets the type.
  */
@@ -955,3 +961,193 @@ int art_iter_prefix(art_tree *t, const unsigned char *key, int key_len, art_call
     }
     return 0;
 }
+
+// Partially fills the Levensthein distance dynamic programming table 
+// Returns a lower bound on the distance. This lower bound can be used
+// in order to abort the range prematurely.
+static inline uint32_t compute_partial_levensthein(uint32_t depth, uint32_t row_offset, uint32_t* edit_row, const unsigned char *query_key, const uint32_t query_len, const unsigned char *search_key, const uint32_t search_len)
+{
+    uint32_t olddiag, lastdiag, min_entry, i;
+
+    // We perform the distance computation in the row_offset-th row of the matrix
+    // Each row has search_len + 1 columns
+    const uint32_t offset = row_offset * (search_len + 1);
+
+    // Copy the previous row into the current row in order to avoid a memory overhead
+    memcpy(edit_row + offset, edit_row + (row_offset - 1) * (search_len + 1), (search_len + 1) * sizeof(uint32_t));
+
+    // If there is nothing to do, stop here
+    if (query_len == 0) {
+        return *(edit_row + offset + search_len);
+    }
+    
+    // Compute the first 0,...,n-1 rows
+    for (i = 0; i < query_len - 1; i++) {
+        lastdiag = depth + i;
+        *(edit_row + offset) = depth + i + 1;
+        for (uint32_t j = 0; j < search_len; j++) {
+            olddiag = *(edit_row + offset + j + 1);
+            *(edit_row + offset + j + 1) = MIN3(*(edit_row + offset + j + 1) + 1, *(edit_row + offset + j) + 1, lastdiag + (query_key[i] == search_key[j] ? 0 : 1));
+            lastdiag = olddiag;
+        }
+    }
+    
+    // Compute the final row where we also keep track of the lower bound on the distance
+    i = query_len - 1;
+    lastdiag = depth + i;
+    min_entry = lastdiag;
+    *(edit_row + offset) = depth + i + 1;
+    for (uint32_t j = 0; j < search_len; j++) {
+        olddiag = *(edit_row + offset + j + 1);
+        *(edit_row + offset + j + 1) = MIN3(*(edit_row + offset + j + 1) + 1, *(edit_row + offset + j) + 1, lastdiag + (query_key[i] == search_key[j] ? 0 : 1));
+        lastdiag = olddiag;
+        min_entry = MIN2(min_entry, *(edit_row + offset + j + 1));
+    }
+    
+    return min_entry;
+}
+
+static int range_search_levensthein_recursive(art_node* n, uint32_t row_offset, uint32_t* edit_row, uint32_t depth, const unsigned char *search_key, const uint32_t search_len, const uint32_t eps, art_callback cb, void *data);
+
+// Descents into the given child node. If the child node is indexed by a character 
+// in the parent node, then the function performs an additional edit distance 
+// calculation
+static inline int conditional_descent(art_node* child, unsigned char c, uint32_t row_offset, uint32_t* edit_row, uint32_t depth, const unsigned char *search_key, const uint32_t search_len, const uint32_t eps, art_callback cb, void *data)
+{
+    if (c > 0) {
+        const uint32_t min_entry = compute_partial_levensthein(depth, row_offset, edit_row, &c, 1, search_key, search_len);
+        row_offset++;
+        if (min_entry > eps)
+        {
+            return 0;
+        }
+
+        return range_search_levensthein_recursive(child, row_offset, edit_row, depth + 1, search_key, search_len, eps, cb, data);
+    } else {
+        return range_search_levensthein_recursive(child, row_offset, edit_row, depth, search_key, search_len, eps, cb, data);
+    }
+}
+
+// Recursively performs a Levensthein range query starting at node n 
+static int range_search_levensthein_recursive(art_node* n, uint32_t row_offset, uint32_t* edit_row, uint32_t depth, const unsigned char *search_key, const uint32_t search_len, const uint32_t eps, art_callback cb, void *data)
+{
+    // Does this node exist?
+    if (n == NULL) {
+        // Nope
+        return 0;
+    } else if (IS_LEAF(n)) {
+        // This is a leaf node
+        art_leaf* leaf = LEAF_RAW(n);
+
+        // Compute the final rows of the edit distance table
+        if (leaf->key_len > depth) {
+            compute_partial_levensthein(depth, row_offset, edit_row, leaf->key + depth, leaf->key_len - depth, search_key, search_len);
+        } else {
+            // We have to look at the previous row in order to determine the distance
+            row_offset--;
+        }
+
+        // Is the distance between the current leaf node and the query object
+        // sufficiently small?
+        if (*(edit_row + row_offset * (search_len + 1) + search_len) <= eps) {
+            // It is -> invoke the callback
+            const int result = cb(data, (const unsigned char*)leaf->key, leaf->key_len, leaf->value);
+            if (result) return result;
+        }
+    } else {
+        // This is an internal node
+
+        // Does it contain a key snippet?
+        if (n->partial_len > 0) 
+        {
+            // Compute the partial Levensthein distance between the query object and the
+            // snippet(partial) stored in this internal node
+            const uint32_t min_entry = compute_partial_levensthein(depth, row_offset, edit_row, n->partial, n->partial_len, search_key, search_len);
+            row_offset++;
+
+            // We can terminate the search here if the smallest entry in the 
+            // edit distance table is already greater than our similarity threshold eps
+            if (min_entry > eps)
+            {
+                return 0;
+            }
+
+            depth += n->partial_len;
+        }
+        
+        // Iterate over all child nodes of the current internal node
+        int idx, result;
+        switch (n->type) {
+            case NODE4:
+                for (int i=0; i < n->num_children; i++) {
+                    result = conditional_descent(((art_node4*)n)->children[i], ((art_node4*)n)->keys[i], row_offset, edit_row, depth, search_key, search_len, eps, cb, data);
+                    if (result) return result;
+                }
+                break;
+
+            case NODE16:
+                for (int i=0; i < n->num_children; i++) {
+                    result = conditional_descent( ((art_node16*)n)->children[i], ((art_node16*)n)->keys[i], row_offset, edit_row, depth, search_key, search_len, eps, cb, data);
+                    if (result) return result;
+                }
+                break;
+
+            case NODE48:
+                for (int i=0; i < 256; i++) {
+                    idx = ((art_node48*)n)->keys[i];
+                    if (!idx) continue;
+                    
+                    result = conditional_descent(((art_node48*)n)->children[idx - 1], (unsigned char) i, row_offset, edit_row, depth, search_key, search_len, eps, cb, data);
+                    if (result) return result;
+                }
+                break;
+
+            case NODE256:
+                for (int i=0; i < 256; i++) {
+                    if (!((art_node256*)n)->children[i]) continue;
+                    
+                    result = conditional_descent(((art_node256*)n)->children[i], (unsigned char) i, row_offset, edit_row, depth, search_key, search_len, eps, cb, data);
+                    if (result) return result;
+                }
+                break;
+
+            default:
+                abort();
+        }
+    }
+
+    return 0;
+}
+
+/**
+ * Performs a Levensthein range query on the given tree. If the 
+ * Levensthein distance between a leaf and the given search_key is
+ * less than or equal to the given threshold eps, then the callback 
+ * function is invoked. If the call callback return non-zero, then the 
+ * iteration stops. 
+ * @arg t The tree to search in
+ * @search_key The query object
+ * @search_len The length of the query object
+ * @eps The similarity threshold / the radius of the Levenstehin neighborhood
+ * @arg cb The callback function to invoke
+ * @arg data Opaque handle passed to the callback
+ * @return 0 on success, or the return of the callback.
+ */
+int art_range_search_levensthein(art_tree *t, const unsigned char *search_key, uint32_t search_len, uint32_t eps, art_callback cb, void *data)
+{
+    // Allocate space for computing the dit distances
+    uint32_t* edit_row = (uint32_t*) calloc(300 * (search_len + 1), sizeof(uint32_t));
+
+    // Initialize the first row to 0,1,2,3...
+    for (uint32_t i = 0; i <= search_len; i++)
+    {
+        edit_row[i] = i;
+    }
+
+    // Start the recursive edit distance search
+    int result = range_search_levensthein_recursive(t->root, 1, edit_row, 0, search_key, search_len, eps, cb, NULL);
+    free(edit_row);
+
+    return result;
+}
+

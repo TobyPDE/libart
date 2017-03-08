@@ -197,6 +197,22 @@ int art_iter(art_tree *t, art_callback cb, void *data);
  */
 int art_iter_prefix(art_tree *t, const unsigned char *prefix, int prefix_len, art_callback cb, void *data);
 
+/**
+ * Performs a Levensthein range query on the given tree. If the 
+ * Levensthein distance between a leaf and the given search_key is
+ * less than or equal to the given threshold eps, then the callback 
+ * function is invoked. If the call callback return non-zero, then the 
+ * iteration stops. 
+ * @arg t The tree to search in
+ * @search_key The query object
+ * @search_len The length of the query object
+ * @eps The similarity threshold / the radius of the Levenstehin neighborhood
+ * @arg cb The callback function to invoke
+ * @arg data Opaque handle passed to the callback
+ * @return 0 on success, or the return of the callback.
+ */
+int art_range_search_levensthein(art_tree *t, const unsigned char *search_key, uint32_t search_len, uint32_t eps, art_callback cb, void *data);
+
 #ifdef __cplusplus
 }
 #endif
